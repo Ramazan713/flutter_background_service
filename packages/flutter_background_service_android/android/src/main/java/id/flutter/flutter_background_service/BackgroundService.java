@@ -40,6 +40,8 @@ import io.flutter.plugin.common.MethodChannel;
 public class BackgroundService extends Service implements MethodChannel.MethodCallHandler {
     private static final String TAG = "BackgroundService";
     private static final String EVENT_DATA_SYNC_TIMEOUT = "BackgroundServiceDataSyncTimeout";
+    private static final String DEFAULT_NOTIFICATION_CHANNEL_ID = "FOREGROUND_DEFAULT";
+    static final String FALLBACK_NOTIFICATION_CHANNEL_ID = "FOREGROUND_FALLBACK";
     private static final String LOCK_NAME = BackgroundService.class.getName()
             + ".Lock";
     public static volatile WakeLock lockStatic = null; // notice static
@@ -51,6 +53,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
     private boolean isManuallyStopped = false;
     private String notificationTitle;
     private String notificationContent;
+    private String configuredNotificationChannelId;
     private String notificationChannelId;
     private int notificationId;
     private String configForegroundTypes;
@@ -88,13 +91,8 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         config = new Config(this);
         mainHandler = new Handler(Looper.getMainLooper());
 
-        String notificationChannelId = config.getNotificationChannelId();
-        if (notificationChannelId == null) {
-            this.notificationChannelId = "FOREGROUND_DEFAULT";
-            createNotificationChannel();
-        } else {
-            this.notificationChannelId = notificationChannelId;
-        }
+        configuredNotificationChannelId = config.getNotificationChannelId();
+        notificationChannelId = resolveNotificationChannelId(configuredNotificationChannelId);
 
         notificationTitle = config.getInitialNotificationTitle();
         notificationContent = config.getInitialNotificationContent();
@@ -154,22 +152,36 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         }
     };
 
-    private void createNotificationChannel() {
-        if (SDK_INT >= Build.VERSION_CODES.O) {
-            CharSequence name = "Background Service";
-            String description = "Executing process in background";
+    String resolveNotificationChannelId(String configuredChannelId) {
+        if (SDK_INT < Build.VERSION_CODES.O) {
+            return configuredChannelId == null ? DEFAULT_NOTIFICATION_CHANNEL_ID : configuredChannelId;
+        }
 
-            int importance = NotificationManager.IMPORTANCE_LOW;
-            NotificationChannel channel = new NotificationChannel(notificationChannelId, name, importance);
-            channel.setDescription(description);
+        NotificationManager notificationManager = getSystemService(NotificationManager.class);
+        if (configuredChannelId != null && notificationManager.getNotificationChannel(configuredChannelId) != null) {
+            return configuredChannelId;
+        }
 
-            NotificationManager notificationManager = getSystemService(NotificationManager.class);
+        String fallbackChannelId = configuredChannelId == null
+                ? DEFAULT_NOTIFICATION_CHANNEL_ID
+                : FALLBACK_NOTIFICATION_CHANNEL_ID;
+        if (notificationManager.getNotificationChannel(fallbackChannelId) == null) {
+            NotificationChannel channel = new NotificationChannel(
+                    fallbackChannelId,
+                    "Background Service",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            channel.setDescription("Executing process in background");
+            channel.setSound(null, null);
+            channel.enableVibration(false);
             notificationManager.createNotificationChannel(channel);
         }
+        return fallbackChannelId;
     }
 
     protected void updateNotificationInfo() {
         if (config.isForeground()) {
+            notificationChannelId = resolveNotificationChannelId(configuredNotificationChannelId);
             String packageName = getApplicationContext().getPackageName();
             Intent i = getPackageManager().getLaunchIntentForPackage(packageName);
 
