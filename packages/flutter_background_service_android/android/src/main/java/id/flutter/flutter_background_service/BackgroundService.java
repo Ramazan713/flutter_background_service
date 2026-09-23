@@ -9,6 +9,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -38,6 +39,7 @@ import io.flutter.plugin.common.MethodChannel;
 
 public class BackgroundService extends Service implements MethodChannel.MethodCallHandler {
     private static final String TAG = "BackgroundService";
+    private static final String EVENT_DATA_SYNC_TIMEOUT = "BackgroundServiceDataSyncTimeout";
     private static final String LOCK_NAME = BackgroundService.class.getName()
             + ".Lock";
     public static volatile WakeLock lockStatic = null; // notice static
@@ -122,6 +124,27 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         methodChannel = null;
         dartEntrypoint = null;
         super.onDestroy();
+    }
+
+    @Override
+    public void onTimeout(int startId, int fgsType) {
+        super.onTimeout(startId, fgsType);
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM || fgsType != ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) {
+            return;
+        }
+        if ((getForegroundServiceType() & ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK) != 0) {
+            setForegroundServiceTypes("mediaPlayback");
+            JSONObject payload = new JSONObject();
+            try {
+                payload.put("method", EVENT_DATA_SYNC_TIMEOUT);
+                payload.put("args", JSONObject.NULL);
+                receiveData(payload);
+            } catch (JSONException e) {
+                Log.e(TAG, "Failed to dispatch dataSync timeout", e);
+            }
+        } else {
+            stopServiceManually();
+        }
     }
 
     private final Pipe.PipeListener listener = new Pipe.PipeListener() {
@@ -279,6 +302,13 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
                 return;
             }
 
+            if (method.equalsIgnoreCase("setForegroundServiceTypes")) {
+                JSONObject arg = (JSONObject) call.arguments;
+                setForegroundServiceTypes(FlutterBackgroundServicePlugin.joinForegroundServiceTypes(arg.getJSONArray("types")));
+                result.success(true);
+                return;
+            }
+
             if (method.equalsIgnoreCase("setForegroundMode")) {
                 JSONObject arg = (JSONObject) call.arguments;
                 boolean value = arg.getBoolean("value");
@@ -302,9 +332,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
             }
 
             if (method.equalsIgnoreCase("stopService")) {
-                isManuallyStopped = true;
-                WatchdogReceiver.remove(this);
-                stopSelf();
+                stopServiceManually();
                 result.success(true);
                 return;
             }
@@ -347,5 +375,17 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         }
 
         result.notImplemented();
+    }
+
+    private void setForegroundServiceTypes(String value) {
+        configForegroundTypes = value;
+        config.setForegroundServiceTypes(value);
+        updateNotificationInfo();
+    }
+
+    private void stopServiceManually() {
+        isManuallyStopped = true;
+        WatchdogReceiver.remove(this);
+        stopSelf();
     }
 }

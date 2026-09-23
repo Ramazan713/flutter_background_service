@@ -10,6 +10,7 @@ import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.HashMap;
@@ -115,7 +116,9 @@ public class FlutterBackgroundServicePlugin implements FlutterPlugin, MethodCall
                 config.setInitialNotificationContent(initialNotificationContent);
                 config.setNotificationChannelId(notificationChannelId);
                 config.setForegroundNotificationId(foregroundNotificationId);
-                config.setForegroundServiceTypes(foregroundServiceTypesStr);
+                if (foregroundServiceTypesStr != null) {
+                    config.setForegroundServiceTypes(foregroundServiceTypesStr);
+                }
 
                 if (autoStart) {
                     start();
@@ -127,6 +130,13 @@ public class FlutterBackgroundServicePlugin implements FlutterPlugin, MethodCall
 
             if ("start".equals(method)) {
                 start();
+                result.success(true);
+                return;
+            }
+
+            if ("setForegroundServiceTypes".equals(method)) {
+                JSONArray foregroundServiceTypes = arg.getJSONArray("types");
+                config.setForegroundServiceTypes(joinForegroundServiceTypes(foregroundServiceTypes));
                 result.success(true);
                 return;
             }
@@ -153,6 +163,20 @@ public class FlutterBackgroundServicePlugin implements FlutterPlugin, MethodCall
         } catch (Exception e) {
             result.error("100", "Failed while read arguments", e.getMessage());
         }
+    }
+
+    static String joinForegroundServiceTypes(JSONArray types) throws JSONException {
+        if (types.length() == 0) {
+            throw new IllegalArgumentException("At least one foreground service type is required");
+        }
+        StringBuilder value = new StringBuilder();
+        for (int i = 0; i < types.length(); i++) {
+            value.append(types.getString(i));
+            if (i < types.length() - 1) {
+                value.append(",");
+            }
+        }
+        return value.toString();
     }
 
     private boolean isServiceRunning() {
