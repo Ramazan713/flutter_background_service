@@ -104,7 +104,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
     @Override
     public void onDestroy() {
-        if (!isManuallyStopped) {
+        if (!isManuallyStopped && !config.isManuallyStopped()) {
             WatchdogReceiver.enqueue(this);
         } else {
             config.setManuallyStopped(true);
@@ -214,11 +214,15 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        config.setManuallyStopped(false);
-        WatchdogReceiver.enqueue(this);
+        prepareServiceStart(this, config);
         runService();
 
         return START_NOT_STICKY;
+    }
+
+    static void prepareServiceStart(Context context, Config config) {
+        config.setManuallyStopped(false);
+        WatchdogReceiver.enqueue(context);
     }
 
     @SuppressLint("WakelockTimeout")
@@ -285,7 +289,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        if (isRunning.get()) {
+        if (isRunning.get() && !config.isManuallyStopped()) {
             WatchdogReceiver.enqueue(getApplicationContext(), 1000);
         }
     }
@@ -397,6 +401,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
     private void stopServiceManually() {
         isManuallyStopped = true;
+        config.setManuallyStopped(true);
         WatchdogReceiver.remove(this);
         stopSelf();
     }

@@ -141,6 +141,11 @@ public class FlutterBackgroundServicePlugin implements FlutterPlugin, MethodCall
                 return;
             }
 
+            if ("stopService".equals(method)) {
+                result.success(stopService(context, config));
+                return;
+            }
+
             if (method.equalsIgnoreCase("sendData")) {
                 synchronized (servicePipe){
                     if (servicePipe.hasListener()){
@@ -177,6 +182,12 @@ public class FlutterBackgroundServicePlugin implements FlutterPlugin, MethodCall
             }
         }
         return value.toString();
+    }
+
+    static boolean stopService(Context context, Config config) {
+        config.setManuallyStopped(true);
+        WatchdogReceiver.remove(context);
+        return context.stopService(new Intent(context, BackgroundService.class));
     }
 
     private boolean isServiceRunning() {

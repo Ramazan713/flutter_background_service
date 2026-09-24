@@ -21,21 +21,33 @@ rootProject.allprojects {
 
 apply plugin: 'com.android.library'
 
+def backgroundServiceTestMinSdkVersion = project.findProperty('flutterBackgroundServiceTestMinSdk')
+
 android {
     compileSdkVersion 36
 
     namespace = "id.flutter.flutter_background_service"
     
     defaultConfig {
-        minSdkVersion 16
+        minSdkVersion backgroundServiceTestMinSdkVersion == null ? 16 : backgroundServiceTestMinSdkVersion.toInteger()
         consumerProguardFiles 'proguard-rules.pro'
     }
 
     lintOptions {
         disable 'InvalidPackage'
     }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            systemProperty 'user.language', 'en'
+            systemProperty 'user.country', 'US'
+        }
+    }
 }
 
 dependencies {
   implementation "androidx.core:core:1.12.0"
+  testImplementation 'junit:junit:4.13.2'
+  testImplementation 'org.robolectric:robolectric:4.16.1'
 }
