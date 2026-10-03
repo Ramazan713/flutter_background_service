@@ -3,6 +3,7 @@ package id.flutter.flutter_background_service;
 import static android.os.Build.VERSION.SDK_INT;
 
 import android.annotation.SuppressLint;
+import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -16,6 +17,7 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.PowerManager.WakeLock;
+import android.service.notification.StatusBarNotification;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -199,17 +201,35 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
                     .setContentText(notificationContent)
                     .setContentIntent(pi);
 
-            try {
-                foregroundTypes = null;
-                if (configForegroundTypes != null && !configForegroundTypes.isEmpty()) {
-                    foregroundTypes = configForegroundTypes.split(",");
+            startForegroundWithNotification(mBuilder.build());
+        }
+    }
+
+    private void startForegroundWithNotification(Notification notification) {
+        try {
+            foregroundTypes = null;
+            if (configForegroundTypes != null && !configForegroundTypes.isEmpty()) {
+                foregroundTypes = configForegroundTypes.split(",");
+            }
+            Integer serviceType = ForegroundTypeMapper.getForegroundServiceType(foregroundTypes);
+            ServiceCompat.startForeground(this, notificationId, notification, serviceType);
+        } catch (SecurityException e) {
+          Log.w(TAG, "Failed to start foreground service due to SecurityException - have you forgotten to request a permission? - " + e.getMessage());
+        }
+    }
+
+    private void updateForegroundServiceTypes() {
+        if (!config.isForeground()) return;
+        if (SDK_INT >= Build.VERSION_CODES.M) {
+            NotificationManager notificationManager = getSystemService(NotificationManager.class);
+            for (StatusBarNotification activeNotification : notificationManager.getActiveNotifications()) {
+                if (activeNotification.getId() == notificationId && activeNotification.getTag() == null) {
+                    startForegroundWithNotification(activeNotification.getNotification());
+                    return;
                 }
-                Integer serviceType = ForegroundTypeMapper.getForegroundServiceType(foregroundTypes);
-                ServiceCompat.startForeground(this, notificationId, mBuilder.build(), serviceType);
-            } catch (SecurityException e) {
-              Log.w(TAG, "Failed to start foreground service due to SecurityException - have you forgotten to request a permission? - " + e.getMessage());
             }
         }
+        updateNotificationInfo();
     }
 
     @Override
@@ -396,7 +416,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
     private void setForegroundServiceTypes(String value) {
         configForegroundTypes = value;
         config.setForegroundServiceTypes(value);
-        updateNotificationInfo();
+        updateForegroundServiceTypes();
     }
 
     private void stopServiceManually() {
