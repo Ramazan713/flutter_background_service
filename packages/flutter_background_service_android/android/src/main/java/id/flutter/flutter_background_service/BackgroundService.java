@@ -4,6 +4,7 @@ import static android.os.Build.VERSION.SDK_INT;
 
 import android.annotation.SuppressLint;
 import android.app.Notification;
+import android.app.ForegroundServiceStartNotAllowedException;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -61,6 +62,19 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
     private String configForegroundTypes;
     private String[] foregroundTypes;
     private Handler mainHandler;
+    private boolean foregroundStartBlocked;
+    private boolean dataSyncUnavailable;
+    private boolean commandChannelReady;
+    private boolean dataSyncTimeoutDispatched;
+    private boolean dataSyncStopAcknowledged;
+    private final Runnable dataSyncStopDeadline = () -> {
+        if (!dataSyncStopAcknowledged) {
+            Log.w(TAG, "dataSync stop was not acknowledged; stopping service");
+            stopServiceManually();
+        }
+    };
+
+    enum ForegroundStartResult { STARTED, MEDIA_PLAYBACK_ONLY, STOPPED }
 
     synchronized public static PowerManager.WakeLock getLock(Context context) {
         if (lockStatic == null) {
@@ -100,12 +114,13 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         notificationContent = config.getInitialNotificationContent();
         notificationId = config.getForegroundNotificationId();
         configForegroundTypes = config.getForegroundServiceTypes();
-        updateNotificationInfo();
+        if (updateNotificationInfo() == ForegroundStartResult.STOPPED) return;
         onStartCommand(null, -1, -1);
     }
 
     @Override
     public void onDestroy() {
+        if (mainHandler != null) mainHandler.removeCallbacks(dataSyncStopDeadline);
         if (!isManuallyStopped && !config.isManuallyStopped()) {
             WatchdogReceiver.enqueue(this);
         } else {
@@ -133,14 +148,8 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
             return;
         }
         if ((getForegroundServiceType() & ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK) != 0) {
-            setForegroundServiceTypes("mediaPlayback");
-            JSONObject payload = new JSONObject();
-            try {
-                payload.put("method", EVENT_DATA_SYNC_TIMEOUT);
-                payload.put("args", JSONObject.NULL);
-                receiveData(payload);
-            } catch (JSONException e) {
-                Log.e(TAG, "Failed to dispatch dataSync timeout", e);
+            if (setForegroundServiceTypes("mediaPlayback") != ForegroundStartResult.STOPPED) {
+                markDataSyncUnavailable();
             }
         } else {
             stopServiceManually();
@@ -181,7 +190,8 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         return fallbackChannelId;
     }
 
-    protected void updateNotificationInfo() {
+    protected ForegroundStartResult updateNotificationInfo() {
+        if (foregroundStartBlocked) return ForegroundStartResult.STOPPED;
         if (config.isForeground()) {
             notificationChannelId = resolveNotificationChannelId(configuredNotificationChannelId);
             String packageName = getApplicationContext().getPackageName();
@@ -201,39 +211,108 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
                     .setContentText(notificationContent)
                     .setContentIntent(pi);
 
-            startForegroundWithNotification(mBuilder.build());
+            return startForegroundWithNotification(mBuilder.build());
         }
+        return ForegroundStartResult.STARTED;
     }
 
-    private void startForegroundWithNotification(Notification notification) {
-        try {
-            foregroundTypes = null;
-            if (configForegroundTypes != null && !configForegroundTypes.isEmpty()) {
-                foregroundTypes = configForegroundTypes.split(",");
+    private ForegroundStartResult startForegroundWithNotification(Notification notification) {
+        if (foregroundStartBlocked) return ForegroundStartResult.STOPPED;
+        foregroundTypes = null;
+        if (configForegroundTypes != null && !configForegroundTypes.isEmpty()) {
+            foregroundTypes = configForegroundTypes.split(",");
+        }
+        int serviceType = ForegroundTypeMapper.getForegroundServiceType(foregroundTypes);
+        if (dataSyncUnavailable && (serviceType & ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) != 0) {
+            serviceType &= ~ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+            if (serviceType != ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK) {
+                stopServiceManually();
+                return ForegroundStartResult.STOPPED;
             }
-            Integer serviceType = ForegroundTypeMapper.getForegroundServiceType(foregroundTypes);
-            ServiceCompat.startForeground(this, notificationId, notification, serviceType);
+        }
+        try {
+            promoteToForeground(notification, serviceType);
+            if (dataSyncUnavailable && serviceType == ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK) {
+                configForegroundTypes = "mediaPlayback";
+                config.setForegroundServiceTypes(configForegroundTypes);
+                return ForegroundStartResult.MEDIA_PLAYBACK_ONLY;
+            }
+            return ForegroundStartResult.STARTED;
         } catch (SecurityException e) {
-          Log.w(TAG, "Failed to start foreground service due to SecurityException - have you forgotten to request a permission? - " + e.getMessage());
+            Log.w(TAG, "Failed to start foreground service due to SecurityException - have you forgotten to request a permission? - " + e.getMessage());
+        } catch (RuntimeException e) {
+            // The platform exception does not exist before Android 12. Preserve unrelated failures.
+            if (SDK_INT < Build.VERSION_CODES.S || !(e instanceof ForegroundServiceStartNotAllowedException)) throw e;
+            boolean playbackAndSync = serviceType == (ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            boolean quotaExhausted = SDK_INT >= 35
+                    && (serviceType & ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) != 0
+                    && e.getMessage() != null
+                    && (e.getMessage().equals("Time limit already exhausted for foreground service type dataSync")
+                    // AOSP labels a combined bitmask "unknown"; of these two types only dataSync is time-limited.
+                    || (playbackAndSync && e.getMessage().equals("Time limit already exhausted for foreground service type unknown")));
+            if (quotaExhausted && playbackAndSync) {
+                try {
+                    promoteToForeground(notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                    configForegroundTypes = "mediaPlayback";
+                    config.setForegroundServiceTypes(configForegroundTypes);
+                    Log.w(TAG, "dataSync unavailable; continuing with mediaPlayback only");
+                    markDataSyncUnavailable();
+                    return ForegroundStartResult.MEDIA_PLAYBACK_ONLY;
+                } catch (RuntimeException fallbackError) {
+                    if (!(fallbackError instanceof ForegroundServiceStartNotAllowedException) && !(fallbackError instanceof SecurityException)) throw fallbackError;
+                    Log.w(TAG, "mediaPlayback fallback rejected; stopping service: " + fallbackError.getMessage());
+                }
+            } else {
+                Log.w(TAG, (quotaExhausted ? "dataSync quota exhausted" : "Foreground start rejected (quota not confirmed)") + "; stopping service: " + e.getMessage());
+            }
+        }
+        stopServiceManually();
+        return ForegroundStartResult.STOPPED;
+    }
+
+    void promoteToForeground(Notification notification, int serviceType) {
+        ServiceCompat.startForeground(this, notificationId, notification, serviceType);
+    }
+
+    private void markDataSyncUnavailable() {
+        if (dataSyncUnavailable) return;
+        dataSyncUnavailable = true;
+        // This is a failure deadline, not a delivery delay. Listener readiness triggers delivery.
+        mainHandler.postDelayed(dataSyncStopDeadline, 10000);
+        dispatchDataSyncTimeout();
+    }
+
+    private void dispatchDataSyncTimeout() {
+        if (!dataSyncUnavailable || dataSyncTimeoutDispatched || !commandChannelReady || methodChannel == null || foregroundStartBlocked) return;
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("method", EVENT_DATA_SYNC_TIMEOUT);
+            payload.put("args", JSONObject.NULL);
+            dataSyncTimeoutDispatched = true;
+            methodChannel.invokeMethod("onReceiveData", payload);
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to dispatch dataSync timeout", e);
+            stopServiceManually();
         }
     }
 
-    private void updateForegroundServiceTypes() {
-        if (!config.isForeground()) return;
+    private ForegroundStartResult updateForegroundServiceTypes() {
+        if (foregroundStartBlocked) return ForegroundStartResult.STOPPED;
+        if (!config.isForeground()) return ForegroundStartResult.STARTED;
         if (SDK_INT >= Build.VERSION_CODES.M) {
             NotificationManager notificationManager = getSystemService(NotificationManager.class);
             for (StatusBarNotification activeNotification : notificationManager.getActiveNotifications()) {
                 if (activeNotification.getId() == notificationId && activeNotification.getTag() == null) {
-                    startForegroundWithNotification(activeNotification.getNotification());
-                    return;
+                    return startForegroundWithNotification(activeNotification.getNotification());
                 }
             }
         }
-        updateNotificationInfo();
+        return updateNotificationInfo();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (foregroundStartBlocked) return START_NOT_STICKY;
         prepareServiceStart(this, config);
         runService();
 
@@ -247,6 +326,7 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
     @SuppressLint("WakelockTimeout")
     private void runService() {
+        if (foregroundStartBlocked) return;
         try {
             if (isRunning.get() || (backgroundEngine != null && !backgroundEngine.getDartExecutor().isExecutingDart())) {
                 Log.v(TAG, "Service already running, using existing service");
@@ -254,9 +334,9 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
             }
 
             Log.v(TAG, "Starting flutter engine for background service");
-            getLock(getApplicationContext()).acquire();
 
-            updateNotificationInfo();
+            if (updateNotificationInfo() == ForegroundStartResult.STOPPED) return;
+            getLock(getApplicationContext()).acquire();
 
             FlutterLoader flutterLoader = FlutterInjector.instance().flutterLoader();
             // initialize flutter if it's not initialized yet
@@ -340,8 +420,8 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
             if (method.equalsIgnoreCase("setForegroundServiceTypes")) {
                 JSONObject arg = (JSONObject) call.arguments;
-                setForegroundServiceTypes(FlutterBackgroundServicePlugin.joinForegroundServiceTypes(arg.getJSONArray("types")));
-                result.success(true);
+                ForegroundStartResult startResult = setForegroundServiceTypes(FlutterBackgroundServicePlugin.joinForegroundServiceTypes(arg.getJSONArray("types")));
+                result.success(startResult == ForegroundStartResult.STARTED);
                 return;
             }
 
@@ -350,7 +430,10 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
                 boolean value = arg.getBoolean("value");
                 config.setIsForeground(value);
                 if (value) {
-                    updateNotificationInfo();
+                    if (updateNotificationInfo() == ForegroundStartResult.STOPPED) {
+                        result.success(false);
+                        return;
+                    }
                     backgroundEngine.getServiceControlSurface().onMoveToForeground();
                 } else {
                     stopForeground(true);
@@ -375,6 +458,14 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
             if (method.equalsIgnoreCase("sendData")) {
                 try {
+                    JSONObject data = (JSONObject) call.arguments;
+                    if ("background_ready".equals(data.optString("method"))) {
+                        commandChannelReady = true;
+                        dispatchDataSyncTimeout();
+                    } else if ((EVENT_DATA_SYNC_TIMEOUT + "Acknowledged").equals(data.optString("method")) && dataSyncTimeoutDispatched) {
+                        dataSyncStopAcknowledged = true;
+                        mainHandler.removeCallbacks(dataSyncStopDeadline);
+                    }
                     if (FlutterBackgroundServicePlugin.mainPipe.hasListener()){
                         FlutterBackgroundServicePlugin.mainPipe.invoke((JSONObject) call.arguments);
                     }
@@ -413,13 +504,16 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         result.notImplemented();
     }
 
-    private void setForegroundServiceTypes(String value) {
+    private ForegroundStartResult setForegroundServiceTypes(String value) {
+        if (foregroundStartBlocked) return ForegroundStartResult.STOPPED;
         configForegroundTypes = value;
         config.setForegroundServiceTypes(value);
-        updateForegroundServiceTypes();
+        return updateForegroundServiceTypes();
     }
 
     private void stopServiceManually() {
+        foregroundStartBlocked = true;
+        if (mainHandler != null) mainHandler.removeCallbacks(dataSyncStopDeadline);
         isManuallyStopped = true;
         config.setManuallyStopped(true);
         WatchdogReceiver.remove(this);
